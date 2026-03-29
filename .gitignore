@@ -20,6 +20,7 @@ workspace/
 # Session & audit logs
 session_backup.json
 agent_audit.md
+FEATURES.md
 
 # IDE / Editor
 .vscode/
@@ -35,3 +36,4 @@ desktop.ini
 
 # Environment variables
 .env
+

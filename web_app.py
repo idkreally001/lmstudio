@@ -110,11 +110,36 @@ def _startup():
     init_tts()
 
 
+def _generate_tts_audio(response_text):
+    """Generate TTS audio from response text. Returns URL path or None."""
+    clean = re.sub(r'<think>[\s\S]*?</think>', '', response_text)
+    clean = re.sub(r'### \[TOOL_OUTPUT\] ###[\s\S]*?### \[END_OUTPUT\] ###', '', clean)
+    clean = re.sub(r'[*#~`_\[\]]', '', clean).strip()
+    clean = emoji.replace_emoji(clean, replace='')
+    if not clean:
+        return None
+    filename = f"tts_{int(time.time())}.mp3"
+    out_path = os.path.join(TTS_DIR, filename)
+    try:
+        async def render():
+            comm = edge_tts.Communicate(clean, "en-US-ChristopherNeural", rate="+15%")
+            await comm.save(out_path)
+        asyncio.run(render())
+        cleanup_tts(5)
+        return f"/tts/{filename}"
+    except Exception as e:
+        print(f"[!] TTS generation failure: {e}")
+        return None
+
+
 with app.app_context():
     _startup()
-    # Start background cleanup worker for TTS audio files
     start_cleanup_worker(TTS_DIR, interval=300)
 
+bridge.on_audit_callback = lambda: socketio.emit('audit_update')
+bridge.on_workspace_callback = lambda: socketio.emit('workspace_update')
+bridge.on_history_callback = lambda: socketio.emit('history_update')
+bridge.on_conversations_callback = lambda: socketio.emit('conversations_update')
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -131,38 +156,8 @@ def chat():
         user_input = request.json.get('query', '').strip()
         if not user_input:
             return jsonify({'answer': 'Empty query received.'}), 400
-            
         response = bridge.chat(user_input)
-        
-        # Audio rendering block processing
-        audio_url = None
-        
-        # Strip tags and markdown for clean speech
-        clean_text = re.sub(r'<think>[\s\S]*?</think>', '', response)
-        clean_text = re.sub(r'### \[TOOL_OUTPUT\] ###[\s\S]*?### \[END_OUTPUT\] ###', '', clean_text)
-        clean_text = re.sub(r'[*#~`_\[\]]', '', clean_text).strip()
-        
-        # Remove emojis completely so the voice doesn't stumble
-        clean_text = emoji.replace_emoji(clean_text, replace='')
-        
-        if clean_text:
-            filename = f"tts_{int(time.time())}.mp3"
-            out_path = os.path.join(TTS_DIR, filename)
-            
-            # Use asyncio to execute edge-tts (takes zero local ram)
-            async def render():
-                # Adjusted to a Male voice (Christopher) and increased speed by 15%
-                comm = edge_tts.Communicate(clean_text, "en-US-ChristopherNeural", rate="+15%")
-                await comm.save(out_path)
-            
-            try:
-                asyncio.run(render())
-                audio_url = f"/tts/{filename}"
-                # Clean up old files after successfully generating a new one
-                cleanup_tts(5)
-            except Exception as render_err:
-                print(f"[!] TTS generation failure: {render_err}")
-                
+        audio_url = _generate_tts_audio(response)
         return jsonify({'answer': response, 'audio_url': audio_url})
     except Exception as exc:
         return jsonify({'answer': f'Web App Error: {exc}'}), 500
@@ -265,6 +260,76 @@ def export_audit():
     if not os.path.exists(path):
         return jsonify({'error': 'Audit log not found.'}), 404
     return send_file(path, as_attachment=True, download_name='agent_audit.md', mimetype='text/markdown')
+
+
+# ---------------------------------------------------------------------------
+# Model management
+# ---------------------------------------------------------------------------
+@app.route('/models')
+@require_token
+def get_models():
+    models = bridge.get_available_models()
+    return jsonify({'models': models, 'current': bridge.model})
+
+
+@app.route('/model', methods=['POST'])
+@require_token
+def set_model():
+    model_id = (request.json or {}).get('model', '')
+    if not model_id:
+        return jsonify({'error': 'No model specified'}), 400
+    bridge.set_model(model_id)
+    return jsonify({'model': bridge.model})
+
+
+# ---------------------------------------------------------------------------
+# Conversation persistence
+# ---------------------------------------------------------------------------
+@app.route('/conversations')
+@require_token
+def list_conversations():
+    return jsonify({'conversations': bridge.list_conversations(), 'current': bridge.current_conversation_id})
+
+
+@app.route('/conversations', methods=['POST'])
+@require_token
+def new_conversation():
+    cid = bridge.new_conversation()
+    return jsonify({'id': cid})
+
+
+@app.route('/conversations/<conv_id>', methods=['PUT'])
+@require_token
+def load_conversation(conv_id):
+    ok = bridge.load_conversation(conv_id)
+    if not ok:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify({'id': conv_id, 'history': [
+        {'role': m['role'], 'content': m.get('content', '')} for m in bridge.history
+        if m['role'] in ('user', 'assistant') and m.get('content', '').strip()
+    ]})
+
+
+@app.route('/conversations/<conv_id>', methods=['DELETE'])
+@require_token
+def delete_conversation(conv_id):
+    bridge.delete_conversation(conv_id)
+    return jsonify({'status': 'deleted'})
+
+
+# ---------------------------------------------------------------------------
+# Workspace file serving (for inline images)
+# ---------------------------------------------------------------------------
+@app.route('/workspace/file/<path:filepath>')
+@require_token
+def serve_workspace_file(filepath):
+    container_path = safe_path(filepath)
+    if not container_path:
+        return jsonify({'error': 'Invalid path'}), 400
+    local = os.path.join(WORKSPACE_ROOT, filepath)
+    if not os.path.isfile(local):
+        return jsonify({'error': 'File not found'}), 404
+    return send_file(local)
 
 
 @app.route('/run_script', methods=['POST'])
@@ -456,6 +521,43 @@ def on_disconnect():
             process.terminate()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Streaming chat via Socket.io
+# ---------------------------------------------------------------------------
+@socketio.on('chat_message')
+def on_chat_message(data):
+    sid = request.sid
+    query = (data or {}).get('query', '').strip()
+    if not query:
+        socketio.emit('chat_done', {}, room=sid)
+        return
+
+    collected_tokens = []
+
+    def emit_fn(event, payload):
+        if event == 'chat_token':
+            collected_tokens.append(payload.get('content', ''))
+        socketio.emit(event, payload, room=sid)
+
+    def _run():
+        try:
+            bridge.chat_stream(query, emit_fn)
+        except Exception as e:
+            socketio.emit('chat_token', {'content': f'Error: {e}'}, room=sid)
+            socketio.emit('chat_done', {}, room=sid)
+
+        # Generate TTS from accumulated content
+        full_text = ''.join(collected_tokens)
+        if full_text.strip():
+            audio_url = _generate_tts_audio(full_text)
+            if audio_url:
+                socketio.emit('chat_audio', {'audio_url': audio_url}, room=sid)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
 
 
 # ---------------------------------------------------------------------------

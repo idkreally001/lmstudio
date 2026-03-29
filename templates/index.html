@@ -54,9 +54,10 @@
                 <h1 class="font-bold text-md tracking-tight">RESEARCH_AGENT</h1>
             </div>
             <div id="status-badges" class="flex gap-2" aria-live="polite">
-                <div id="model-badge" class="bg-blue-900/20 text-blue-400 text-[10px] px-2 py-1 rounded border border-blue-800/50 font-mono hidden">
-                    <i class="fas fa-brain mr-1" aria-hidden="true"></i>
-                    <span id="model-name">...</span>
+                <!-- Current Model Display -->
+                <div class="bg-blue-900/20 text-blue-400 text-[10px] px-2 py-1 rounded border border-blue-800/50 font-mono flex items-center gap-2">
+                    <i class="fas fa-brain" aria-hidden="true"></i>
+                    <span id="current-model-display">Loading model...</span>
                 </div>
                 <div id="container-badge" class="bg-green-900/20 text-green-400 text-[10px] px-2 py-1 rounded border border-green-800/50 font-mono hidden">
                     <i class="fas fa-box mr-1" aria-hidden="true"></i>
@@ -75,21 +76,6 @@
                 aria-label="Export audit log as Markdown" title="Export History (.md)">
                 <i class="fas fa-download mr-2 text-emerald-400" aria-hidden="true"></i>Export
             </button>
-            <button onclick="applyCommand('/save')"
-                class="hover:bg-gray-700 px-3 py-1 rounded text-xs transition border border-gray-700 text-gray-300"
-                aria-label="Save workspace" title="Save session">
-                <i class="fas fa-save mr-2 text-blue-400" aria-hidden="true"></i>Save
-            </button>
-            <button onclick="loadHistory()"
-                class="hover:bg-gray-700 px-3 py-1 rounded text-xs transition border border-gray-700 text-gray-300"
-                aria-label="Load previous session" title="Load session">
-                <i class="fas fa-upload mr-2 text-green-400" aria-hidden="true"></i>Load
-            </button>
-            <button onclick="applyCommand('/clear')"
-                class="hover:bg-gray-700 px-3 py-1 rounded text-xs transition border border-gray-700 text-gray-300"
-                aria-label="Clear chat history" title="Clear chat context">
-                <i class="fas fa-eraser mr-2 text-blue-400" aria-hidden="true"></i>Clear Chat
-            </button>
             <button onclick="applyCommand('/reset')"
                 class="text-red-400 hover:bg-red-900/30 px-3 py-1 rounded text-xs transition border border-red-900/30"
                 aria-label="Reset environment" title="Wipe /workspace">
@@ -100,17 +86,46 @@
 
     <div class="flex flex-1 overflow-hidden">
 
-        <!-- File Explorer Sidebar -->
-        <aside class="w-64 border-r border-gray-800 bg-[#0d1117] flex flex-col" aria-label="File explorer">
-            <div class="p-3 border-b border-gray-800 flex justify-between items-center text-[10px] font-bold uppercase text-gray-500 tracking-widest bg-[#161b22]">
-                File Explorer
-                <button onclick="refreshWorkspace()" class="hover:text-white transition" aria-label="Refresh file explorer">
-                    <i class="fas fa-sync-alt" aria-hidden="true"></i>
+        <!-- Left Sidebar — Tabs: Conversations | Files -->
+        <aside class="w-64 border-r border-gray-800 bg-[#0d1117] flex flex-col" aria-label="Left sidebar">
+            <!-- Tab Headers -->
+            <div class="border-b border-gray-800 bg-[#161b22] flex">
+                <button id="tab-convos" onclick="switchLeftTab('convos')"
+                    class="flex-1 p-2 text-[10px] font-bold uppercase tracking-widest text-blue-400 border-b-2 border-blue-500 transition"
+                    aria-selected="true" role="tab">
+                    <i class="fas fa-comments mr-1" aria-hidden="true"></i> Chats
+                </button>
+                <button id="tab-files" onclick="switchLeftTab('files')"
+                    class="flex-1 p-2 text-[10px] font-bold uppercase tracking-widest text-gray-500 border-b-2 border-transparent hover:text-gray-300 transition"
+                    aria-selected="false" role="tab">
+                    <i class="fas fa-folder mr-1" aria-hidden="true"></i> Files
                 </button>
             </div>
-            <div id="workspace-tree"
-                class="p-4 font-mono text-[11px] overflow-y-auto custom-scrollbar flex-1 whitespace-pre text-blue-300"
-                role="tree" aria-label="Workspace files">
+
+            <!-- Conversations Panel -->
+            <div id="panel-convos" class="flex-1 flex flex-col overflow-hidden">
+                <div class="p-2 border-b border-gray-800">
+                    <button onclick="createNewConversation()" class="w-full text-[10px] px-3 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white font-bold transition flex items-center justify-center gap-2">
+                        <i class="fas fa-plus" aria-hidden="true"></i> New Chat
+                    </button>
+                </div>
+                <div id="conversation-list" class="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1" role="list" aria-label="Saved conversations">
+                    <div class="text-[10px] text-gray-600 italic text-center pt-4">No conversations yet.</div>
+                </div>
+            </div>
+
+            <!-- Files Panel -->
+            <div id="panel-files" class="flex-1 flex flex-col overflow-hidden hidden">
+                <div class="p-3 border-b border-gray-800 flex justify-between items-center text-[10px] font-bold uppercase text-gray-500 tracking-widest bg-[#161b22]">
+                    File Explorer
+                    <button onclick="refreshWorkspace()" class="hover:text-white transition" aria-label="Refresh file explorer">
+                        <i class="fas fa-sync-alt" aria-hidden="true"></i>
+                    </button>
+                </div>
+                <div id="workspace-tree"
+                    class="p-4 font-mono text-[11px] overflow-y-auto custom-scrollbar flex-1 whitespace-pre text-blue-300"
+                    role="tree" aria-label="Workspace files">
+                </div>
             </div>
         </aside>
 
@@ -145,6 +160,10 @@
                                 <i class="fas fa-times" aria-hidden="true"></i>
                             </button>
                         </div>
+                    </div>
+                    <!-- Image preview (shown for image files) -->
+                    <div id="image-preview" class="hidden flex-1 overflow-auto p-4 flex items-center justify-center bg-[#0a0e14]">
+                        <img id="preview-img" class="max-w-full max-h-full rounded-lg shadow-2xl" alt="Preview">
                     </div>
                     <div id="editor" aria-label="File editor"></div>
                 </div>
@@ -188,13 +207,6 @@
                             <i class="fas fa-save mr-3 w-4 text-blue-400" aria-hidden="true"></i>
                             <span>/save</span>
                             <span class="text-[9px] opacity-40 ml-auto">Persist</span>
-                        </div>
-                        <div class="command-item p-3 hover:bg-gray-700 cursor-pointer text-sm flex items-center transition"
-                             role="option" tabindex="0" onclick="applyCommand('/clear')"
-                             onkeydown="if(event.key==='Enter') applyCommand('/clear')">
-                            <i class="fas fa-eraser mr-3 w-4 text-blue-400" aria-hidden="true"></i>
-                            <span>/clear</span>
-                            <span class="text-[9px] opacity-40 ml-auto">Reset Chat</span>
                         </div>
                         <div class="command-item p-3 hover:bg-red-900/50 cursor-pointer text-sm flex items-center transition"
                              role="option" tabindex="0" onclick="applyCommand('/reset')"

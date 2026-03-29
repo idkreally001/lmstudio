@@ -1,4 +1,5 @@
 import os
+import uuid
 import requests
 import json
 import importlib
@@ -87,6 +88,8 @@ def _sanitize_args(args: dict) -> dict:
 
 
 class AIBridge:
+    CONV_DIR = os.path.join(os.path.dirname(__file__), "conversations")
+
     def __init__(self, url="http://localhost:1234/v1", max_iterations=10, max_turns=25, hard_limit=True):
         self.url            = url
         self.max_iterations = max_iterations
@@ -99,6 +102,14 @@ class AIBridge:
         self.audit_log      = "agent_audit.md"
         self.current_tool   = None
         self.cancel_flag    = False
+        self.current_conversation_id = str(uuid.uuid4())
+
+        self.on_audit_callback = None
+        self.on_workspace_callback = None
+        self.on_history_callback = None
+        self.on_conversations_callback = None
+
+        os.makedirs(self.CONV_DIR, exist_ok=True)
 
         with open(self.audit_log, "a", encoding="utf-8") as f:
             f.write(f"\n\n{'='*50}\n")
@@ -131,6 +142,17 @@ class AIBridge:
         except Exception:
             return "default-model"
 
+    def get_available_models(self):
+        try:
+            response = requests.get(f"{self.url}/models", timeout=5)
+            return response.json().get("data", [])
+        except Exception:
+            return []
+
+    def set_model(self, model_id):
+        self.model = model_id
+        return self.model
+
     def tool(self, schema):
         def decorator(func):
             name = schema["function"]["name"]
@@ -160,6 +182,9 @@ class AIBridge:
         timestamp = datetime.now().strftime("%H:%M:%S")
         with open(self.audit_log, "a", encoding="utf-8") as f:
             f.write(f"### [{timestamp}] {role.upper()}\n{content}\n\n---\n")
+            
+        if self.on_audit_callback:
+            self.on_audit_callback()
 
     # ------------------------------------------------------------------
     # Main chat loop
@@ -193,18 +218,7 @@ class AIBridge:
             raw_prompt = yaml_prompt or cfg.get("system_prompt")
             if isinstance(raw_prompt, list):
                 raw_prompt = "\n".join(raw_prompt)
-            system_prompt = raw_prompt or (
-                    "You are an Autonomous AI Research Agent operating securely within a Linux Docker sandbox (ai_sandbox). "
-                    "Your goal is to solve complex technical tasks, write and debug code, and perform research independently.\n\n"
-                    "CRITICAL OPERATIONAL RULES:\n"
-                    "1. ENVIRONMENT: You are restricted to the '/workspace' directory.\n"
-                    "2. SAFE CODING: Wrap code in triple-quotes to prevent newline errors.\n"
-                    "3. SELF-CORRECTION: If a script fails, read the error and fix it yourself.\n"
-                    "4. DATA HANDLING: Summarize tool outputs; don't dump raw data.\n"
-                    "5. EFFICIENCY: Monitor your action limits. Don't repeat failures.\n"
-                    "6. REASONING: Use <think> blocks for planning. Keep final replies focused.\n"
-                    "7. PATHS: Always use Linux-style forward-slash paths (e.g. /workspace/file.py)."
-            )
+            system_prompt = raw_prompt
             self.history.append({"role": "system", "content": system_prompt})
             # --- NEW: Log the initial system message ---
             self.log_action("System", system_prompt)
@@ -319,6 +333,9 @@ class AIBridge:
                             "name":         func_name,
                             "content":      processed_result,
                         })
+                        
+                        if self.on_workspace_callback:
+                            self.on_workspace_callback()
 
                         if "TERMINATE_SIGNAL:" in raw_result:
                             return raw_result.replace("TERMINATE_SIGNAL:", "Research Concluded:").strip()
@@ -336,5 +353,320 @@ class AIBridge:
 
             except Exception as e:
                 return f"Bridge Error: {e}"
+
+    # ------------------------------------------------------------------
+    # Conversation persistence
+    # ------------------------------------------------------------------
+    def save_conversation(self, title=None):
+        if not self.history:
+            return None
+        if not title:
+            for msg in self.history:
+                if msg["role"] == "user":
+                    title = msg["content"][:80]
+                    break
+            title = title or "Untitled"
+
+        path = os.path.join(self.CONV_DIR, f"{self.current_conversation_id}.json")
+        created = datetime.now().isoformat()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    created = json.load(f).get("created_at", created)
+            except Exception:
+                pass
+
+        data = {
+            "id": self.current_conversation_id,
+            "title": title,
+            "created_at": created,
+            "updated_at": datetime.now().isoformat(),
+            "message_count": len(self.history),
+            "history": self.history,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            
+        if self.on_conversations_callback:
+            self.on_conversations_callback()
+            
+        return data["id"]
+
+    def list_conversations(self):
+        convos = []
+        for fname in os.listdir(self.CONV_DIR):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(self.CONV_DIR, fname), "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                convos.append({
+                    "id": d["id"], "title": d.get("title", "Untitled"),
+                    "created_at": d.get("created_at"), "updated_at": d.get("updated_at"),
+                    "message_count": d.get("message_count", 0),
+                })
+            except Exception:
+                pass
+        convos.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
+        return convos
+
+    def load_conversation(self, conv_id):
+        path = os.path.join(self.CONV_DIR, f"{conv_id}.json")
+        if not os.path.exists(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.history = data.get("history", [])
+        self.current_conversation_id = conv_id
+        
+        if self.on_conversations_callback:
+            self.on_conversations_callback()
+        if self.on_history_callback:
+            self.on_history_callback()
+            
+        return True
+
+    def delete_conversation(self, conv_id):
+        path = os.path.join(self.CONV_DIR, f"{conv_id}.json")
+        if os.path.exists(path):
+            os.remove(path)
+            if self.current_conversation_id == conv_id:
+                self.new_conversation()
+            if self.on_conversations_callback:
+                self.on_conversations_callback()
+            return True
+        return False
+
+    def new_conversation(self):
+        if self.history:
+            self.save_conversation()
+        self.history = []
+        self.current_conversation_id = str(uuid.uuid4())
+        
+        if self.on_conversations_callback:
+            self.on_conversations_callback()
+        if self.on_history_callback:
+            self.on_history_callback()
+            
+        return self.current_conversation_id
+
+    # ------------------------------------------------------------------
+    # Streaming chat
+    # ------------------------------------------------------------------
+    def chat_stream(self, prompt, emit_fn):
+        """Streaming chat — emits events via emit_fn(event_name, payload_dict)."""
+        self.cancel_flag = False
+        cfg = load_config()
+
+        # --- Slash commands (synchronous) ---
+        slash = prompt.strip()
+        if slash == "/clear":
+            self.history = []
+            self.log_action("System", "Chat history cleared")
+            emit_fn("chat_token", {"content": "Chat context has been reset."})
+            emit_fn("chat_done", {})
+            return
+        if slash == "/reset":
+            import subprocess
+            try:
+                subprocess.run(["docker", "exec", "ai_sandbox", "bash", "-c", "rm -rf /workspace/*"])
+                msg = "Workspace cleared."
+            except Exception as e:
+                msg = f"Reset Error: {e}"
+            emit_fn("chat_token", {"content": msg})
+            emit_fn("chat_done", {})
+            return
+        if slash in ("/save", "/load"):
+            result = self.save_session() if slash == "/save" else self.load_session()
+            emit_fn("chat_token", {"content": result})
+            emit_fn("chat_done", {})
+            return
+
+        # --- Init system prompt ---
+        if not self.history:
+            yaml_prompt = _load_prompts_yaml()
+            raw_prompt = yaml_prompt or cfg.get("system_prompt")
+            if isinstance(raw_prompt, list):
+                raw_prompt = "\n".join(raw_prompt)
+            system_prompt = raw_prompt or (
+                "You are an Autonomous AI Research Agent operating securely within a Linux Docker sandbox."
+            )
+            self.history.append({"role": "system", "content": system_prompt})
+            self.log_action("System", system_prompt)
+
+        self.history.append({"role": "user", "content": prompt})
+        self.log_action("User", prompt)
+        
+        if self.on_history_callback:
+            self.on_history_callback()
+
+        tools_used = 0
+        last_failed_call = None
+        self.current_tool = "Thinking..."
+
+        while True:
+            if self.cancel_flag:
+                emit_fn("chat_done", {})
+                return
+
+            payload = {
+                "model":       self.model,
+                "messages":    self.history,
+                "tools":       self.schemas if self.schemas else None,
+                "tool_choice": "auto",
+                "temperature": cfg["temperature"],
+                "max_tokens":  cfg.get("max_tokens", 2048),
+                "stream":      True,
+            }
+
+            try:
+                resp = requests.post(
+                    f"{self.url}/chat/completions",
+                    json=payload, timeout=cfg["timeout"], stream=True,
+                )
+
+                content_buf = ""
+                tc_buf = []  # tool call deltas
+                finish = None
+
+                for raw_line in resp.iter_lines():
+                    if self.cancel_flag:
+                        emit_fn("chat_done", {})
+                        return
+                    if not raw_line:
+                        continue
+                    line_s = raw_line.decode("utf-8", errors="replace").strip()
+                    if line_s == "data: [DONE]":
+                        break
+                    if not line_s.startswith("data: "):
+                        continue
+                    try:
+                        chunk = json.loads(line_s[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    if "choices" not in chunk or not chunk["choices"]:
+                        continue
+
+                    choice = chunk["choices"][0]
+                    delta = choice.get("delta", {})
+                    fr = choice.get("finish_reason")
+                    if fr:
+                        finish = fr
+
+                    # Content tokens
+                    if delta.get("content"):
+                        t = delta["content"]
+                        content_buf += t
+                        emit_fn("chat_token", {"content": t})
+
+                    # Tool call deltas
+                    if delta.get("tool_calls"):
+                        for tcd in delta["tool_calls"]:
+                            idx = tcd.get("index", 0)
+                            while len(tc_buf) <= idx:
+                                tc_buf.append({"id": "", "function": {"name": "", "arguments": ""}})
+                            if tcd.get("id"):
+                                tc_buf[idx]["id"] = tcd["id"]
+                            fn = tcd.get("function", {})
+                            if fn.get("name"):
+                                tc_buf[idx]["function"]["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                tc_buf[idx]["function"]["arguments"] += fn["arguments"]
+
+                # --- Handle response ---
+                if finish == "tool_calls" or (tc_buf and finish != "stop"):
+                    msg = {"role": "assistant", "content": content_buf or ""}
+                    msg["tool_calls"] = [
+                        {"id": tc["id"], "type": "function", "function": tc["function"]}
+                        for tc in tc_buf
+                    ]
+                    self.history.append(msg)
+                    if content_buf:
+                        self.log_action("AI", content_buf)
+
+                    for tc in tc_buf:
+                        func_name = tc["function"]["name"]
+                        call_id = tc["id"]
+                        try:
+                            args = json.loads(tc["function"]["arguments"])
+                        except json.JSONDecodeError:
+                            args = {}
+                        args = _sanitize_args(args)
+
+                        emit_fn("chat_tool_call", {"name": func_name, "args": args})
+                        self.log_action("Tool Call", f"Function: {func_name}\nArguments: {json.dumps(args, indent=2)}")
+                        self.current_tool = f"Running: {func_name}"
+                        tools_used += 1
+
+                        if func_name not in self.registry:
+                            import difflib
+                            sug = difflib.get_close_matches(func_name, self.registry.keys(), n=1)
+                            hint = f" Did you mean '{sug[0]}'?" if sug else ""
+                            raw_result = f"Error: '{func_name}' is not a valid tool.{hint}"
+                        else:
+                            try:
+                                raw_result = str(self.registry[func_name](**args))
+                            except Exception as te:
+                                raw_result = f"Error executing {func_name}: {te}"
+
+                        is_fail = "Error" in raw_result
+                        sig = f"{func_name}::{json.dumps(args, sort_keys=True)}"
+                        if is_fail:
+                            if last_failed_call == sig:
+                                raw_result += "\n\n[CRITICAL]: Same command failed twice. Stopping."
+                            last_failed_call = sig
+                        else:
+                            last_failed_call = None
+
+                        processed = smart_summarize(raw_result)
+                        self.log_action("Tool Output", processed)
+                        emit_fn("chat_tool_result", {"name": func_name, "result": processed})
+
+                        self.history.append({
+                            "role": "tool", "tool_call_id": call_id,
+                            "name": func_name, "content": processed,
+                        })
+                        
+                        if self.on_workspace_callback:
+                            self.on_workspace_callback()
+
+                        if "TERMINATE_SIGNAL:" in raw_result:
+                            emit_fn("chat_done", {})
+                            self.current_tool = None
+                            return
+
+                    if cfg["hard_limit"] and tools_used >= cfg["max_iterations"]:
+                        emit_fn("chat_token", {"content": "\nStopped: Max tool actions reached."})
+                        emit_fn("chat_done", {})
+                        self.current_tool = None
+                        return
+                    continue  # next LLM turn
+
+                # --- Normal text response ---
+                msg = {"role": "assistant", "content": content_buf or ""}
+                self.history.append(msg)
+                
+                if self.on_history_callback:
+                    self.on_history_callback()
+                
+                if finish == "length":
+                    # Auto-heal: model was cut off
+                    self.log_action("System", "[Auto-Continue triggered due to exact token limit hit]")
+                    self.history.append({"role": "user", "content": "[System: Your previous response was cut off due to token limits. Please continue exactly where you left off.]"})
+                    continue
+                
+                if content_buf:
+                    self.log_action("AI", content_buf)
+                self.current_tool = None
+                self.save_conversation()
+                emit_fn("chat_done", {"content": content_buf})
+                return
+
+            except Exception as e:
+                emit_fn("chat_token", {"content": f"Bridge Error: {e}"})
+                emit_fn("chat_done", {})
+                self.current_tool = None
+                return
+
 
 bridge = AIBridge()

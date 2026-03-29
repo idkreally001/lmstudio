@@ -1,7 +1,5 @@
 // =============================================================================
 // CONFIG
-// Inject your token here or via a <meta> tag / env-baked variable.
-// Must match DASHBOARD_TOKEN in the server environment.
 // =============================================================================
 const API_TOKEN = document.querySelector('meta[name="dashboard-token"]')?.content || '';
 
@@ -23,14 +21,15 @@ const fileNameLabel    = document.getElementById('current-file-name');
 // =============================================================================
 let currentController = null;
 let isGenerating      = false;
-let statusInterval    = null;   // guarded — never double-created
+let statusInterval    = null;
 let currentFilePath   = null;
 let _auditCache       = { mtime: null, log: '' };
 let currentAudio      = null;
 let currentAction     = null;
+let streamState       = null;
 
 // =============================================================================
-// HELPERS — authenticated fetch
+// HELPERS
 // =============================================================================
 function apiFetch(url, options = {}) {
     const headers = { 'Content-Type': 'application/json', ...options.headers };
@@ -38,10 +37,141 @@ function apiFetch(url, options = {}) {
     return fetch(url, { ...options, headers });
 }
 
+function escapeHtml(str) {
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// =============================================================================
+// STREAM PARSER — handles <think> tag detection across chunk boundaries
+// =============================================================================
+class StreamParser {
+    constructor() {
+        this.buffer = '';
+        this.inThink = false;
+    }
+
+    feed(text) {
+        this.buffer += text;
+        const events = [];
+        let safety = 0;
+
+        while (this.buffer.length > 0 && safety++ < 500) {
+            if (!this.inThink) {
+                const idx = this.buffer.indexOf('<think>');
+                if (idx === 0) {
+                    this.buffer = this.buffer.slice(7);
+                    this.inThink = true;
+                    events.push({ type: 'thinking_start' });
+                } else if (idx > 0) {
+                    events.push({ type: 'content', text: this.buffer.slice(0, idx) });
+                    this.buffer = this.buffer.slice(idx);
+                } else {
+                    // Check for partial <think> at end
+                    const partial = this._partialMatch('<think>');
+                    if (partial > 0 && this.buffer.length - partial < this.buffer.length) {
+                        const safe = this.buffer.slice(0, this.buffer.length - partial);
+                        if (safe) events.push({ type: 'content', text: safe });
+                        this.buffer = this.buffer.slice(this.buffer.length - partial);
+                        break;
+                    }
+                    events.push({ type: 'content', text: this.buffer });
+                    this.buffer = '';
+                }
+            } else {
+                const idx = this.buffer.indexOf('</think>');
+                if (idx === 0) {
+                    this.buffer = this.buffer.slice(8);
+                    this.inThink = false;
+                    events.push({ type: 'thinking_end' });
+                } else if (idx > 0) {
+                    events.push({ type: 'thinking', text: this.buffer.slice(0, idx) });
+                    this.buffer = this.buffer.slice(idx);
+                } else {
+                    const partial = this._partialMatch('</think>');
+                    if (partial > 0) {
+                        const safe = this.buffer.slice(0, this.buffer.length - partial);
+                        if (safe) events.push({ type: 'thinking', text: safe });
+                        this.buffer = this.buffer.slice(this.buffer.length - partial);
+                        break;
+                    }
+                    events.push({ type: 'thinking', text: this.buffer });
+                    this.buffer = '';
+                }
+            }
+        }
+        return events;
+    }
+
+    _partialMatch(tag) {
+        for (let i = Math.min(tag.length - 1, this.buffer.length); i >= 1; i--) {
+            if (this.buffer.endsWith(tag.slice(0, i))) return i;
+        }
+        return 0;
+    }
+
+    flush() {
+        const events = [];
+        if (this.buffer) {
+            events.push({ type: this.inThink ? 'thinking' : 'content', text: this.buffer });
+            this.buffer = '';
+        }
+        return events;
+    }
+}
+
 // =============================================================================
 // 1. SOCKET.IO
 // =============================================================================
 const socket = io();
+
+// --- Streaming event handlers ---
+socket.on('chat_token', ({ content }) => {
+    if (!streamState) return;
+    const events = streamState.parser.feed(content);
+    processStreamEvents(events);
+});
+
+socket.on('chat_tool_call', ({ name, args }) => {
+    if (!streamState) return;
+    // Flush any buffered content before tool block
+    processStreamEvents(streamState.parser.flush());
+    addToolCallBlock(name, args);
+});
+
+socket.on('chat_tool_result', ({ name, result }) => {
+    if (!streamState) return;
+    updateToolResultBlock(name, result);
+});
+
+socket.on('chat_done', (data) => {
+    if (!streamState) return;
+    finalizeStream();
+});
+
+socket.on('chat_audio', ({ audio_url }) => {
+    // Add TTS button to the last AI message
+    if (audio_url) {
+        const lastMsg = chatContainer.querySelector('.ai-message:last-child');
+        if (lastMsg) addTtsButton(lastMsg, audio_url);
+    }
+});
+
+socket.on('audit_update', () => {
+    fetchAudit();
+});
+
+socket.on('workspace_update', () => {
+    refreshWorkspace();
+});
+
+socket.on('history_update', () => {
+    fetchHistory();
+});
+
+socket.on('conversations_update', () => {
+    fetchConversations();
+});
 
 // =============================================================================
 // 2. ACE EDITOR
@@ -79,6 +209,8 @@ term.onData(data => socket.emit('terminal_input', { input: data }));
 // =============================================================================
 // 4. WORKSPACE & FILE MANAGEMENT
 // =============================================================================
+const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'];
+
 async function refreshWorkspace() {
     try {
         const r = await apiFetch('/workspace');
@@ -88,23 +220,29 @@ async function refreshWorkspace() {
         if (!tree) return;
 
         treeEl.innerHTML = '';
-        // Strip any header/error lines — only process lines that look like paths
         tree.split('\n').forEach(line => {
             const path = line.trim().replace('./', '');
             if (!path || path === '.' || !path.match(/^[\w\-\.\/]+$/)) return;
 
             const div = document.createElement('div');
             const isDir = path.endsWith('/');
+            const ext = path.split('.').pop().toLowerCase();
+            const isImage = IMAGE_EXTS.includes(ext);
+
             div.className = 'hover:bg-gray-800 cursor-pointer px-2 py-1 rounded transition flex items-center gap-2 group text-gray-300';
-            div.setAttribute('role', isDir ? 'treeitem' : 'treeitem');
+            div.setAttribute('role', 'treeitem');
+
+            let icon = isDir ? 'fa-folder text-yellow-500' : 'fa-file-code text-blue-400';
+            if (isImage) icon = 'fa-image text-emerald-400';
+
             div.innerHTML = `
-                <i class="fas ${isDir ? 'fa-folder text-yellow-500' : 'fa-file-code text-blue-400'} text-[10px]" aria-hidden="true"></i>
+                <i class="fas ${icon} text-[10px]" aria-hidden="true"></i>
                 <span class="truncate">${escapeHtml(path)}</span>`;
 
             if (!isDir) {
-                div.onclick = () => openFileInEditor(path);
+                div.onclick = () => isImage ? openImagePreview(path) : openFileInEditor(path);
                 div.setAttribute('tabindex', '0');
-                div.addEventListener('keydown', e => { if (e.key === 'Enter') openFileInEditor(path); });
+                div.addEventListener('keydown', e => { if (e.key === 'Enter') div.click(); });
             }
             treeEl.appendChild(div);
         });
@@ -115,6 +253,8 @@ async function refreshWorkspace() {
 
 async function openFileInEditor(path) {
     fileNameLabel.textContent = `${path} (loading…)`;
+    document.getElementById('image-preview').classList.add('hidden');
+    document.getElementById('editor').style.display = '';
     try {
         const r = await apiFetch(`/api/files?path=${encodeURIComponent(path)}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -134,6 +274,15 @@ async function openFileInEditor(path) {
         fileNameLabel.textContent = `Error loading ${path}`;
         console.error('Failed to load file:', err);
     }
+}
+
+function openImagePreview(path) {
+    fileNameLabel.textContent = path;
+    document.getElementById('editor').style.display = 'none';
+    const preview = document.getElementById('image-preview');
+    preview.classList.remove('hidden');
+    document.getElementById('preview-img').src = `/workspace/file/${encodeURIComponent(path)}`;
+    editorPane.classList.add('active');
 }
 
 async function saveCurrentFile() {
@@ -193,15 +342,7 @@ function toggleTerminal() {
 function applyCommand(cmd) {
     popup.classList.add('hidden');
 
-    if (cmd === '/clear') {
-        currentAction = '/clear';
-        document.getElementById('modal-header-text').textContent = 'Clear Conversation';
-        document.getElementById('modal-body-text').textContent   = 'Are you sure you want to reset the agent\'s chat context? Workspace files will be kept.';
-        confirmModal.classList.remove('hidden');
-        confirmModal.classList.add('flex');
-        requestAnimationFrame(() => document.getElementById('modal-cancel-btn').focus());
-        return;
-    }
+
     if (cmd === '/reset') {
         currentAction = '/reset';
         document.getElementById('modal-header-text').textContent = 'Reset Environment';
@@ -222,15 +363,13 @@ function closeModal() {
     userInput.focus();
 }
 
-// Close modal on backdrop click
 confirmModal.addEventListener('click', e => {
     if (e.target === confirmModal) closeModal();
 });
 
-// Close modal on Escape
 document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
-        if (!confirmModal.classList.contains('hidden')) { closeModal(); }
+        if (!confirmModal.classList.contains('hidden')) closeModal();
     }
 });
 
@@ -251,20 +390,11 @@ async function confirmClear() {
 }
 
 // =============================================================================
-// 6. COMMUNICATION & TELEMETRY
+// 6. STREAMING CHAT
 // =============================================================================
-async function fetchStatus() {
-    try {
-        const r = await apiFetch('/status');
-        if (!r.ok) return;
-        const { tool } = await r.json();
-        const loader = document.getElementById('ai-loading');
-    } catch (e) { /* non-fatal */ }
-}
-
-async function sendMessage() {
+function sendMessage() {
     const query = userInput.value.trim();
-    if (!query || sendBtn.disabled) return;
+    if (!query || isGenerating) return;
 
     renderMessage('user', query);
     userInput.value = '';
@@ -272,29 +402,230 @@ async function sendMessage() {
     popup.classList.add('hidden');
     setLoading(true);
 
-    currentController = new AbortController();
+    // Create streaming message container
+    streamState = createStreamContainer();
 
-    try {
-        const r = await apiFetch('/chat', {
-            method: 'POST',
-            body: JSON.stringify({ query }),
-            signal: currentController.signal,
-        });
-        if (!r.ok) throw new Error(`Server error: ${r.status}`);
-        const { answer, audio_url } = await r.json();
-        renderMessage('ai', answer, audio_url);
-        
-        refreshWorkspace();
-    } catch (err) {
-        if (err.name === 'AbortError') {
-            renderMessage('ai', '<em class="text-gray-500 text-sm"><i class="fas fa-ban mr-2 text-red-400" aria-hidden="true"></i>Generation halted.</em>');
-        } else {
-            renderMessage('ai', `**Bridge Error:** ${escapeHtml(err.message)}`);
+    // Send via Socket.io for streaming
+    socket.emit('chat_message', { query });
+}
+
+function createStreamContainer() {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'flex justify-start relative group';
+
+    const bubble = document.createElement('div');
+    bubble.className = 'ai-message bg-[#161b22] border border-gray-800 max-w-[85%] rounded-2xl px-5 py-4 shadow-xl mb-4 relative overflow-hidden group';
+
+    const content = document.createElement('div');
+    content.className = 'stream-content markdown-body';
+
+    // Streaming text area (raw text, will be replaced with markdown on done)
+    const textArea = document.createElement('span');
+    textArea.className = 'stream-text stream-cursor';
+
+    content.appendChild(textArea);
+    bubble.appendChild(content);
+    wrapper.appendChild(bubble);
+    chatContainer.appendChild(wrapper);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+
+    return {
+        wrapper,
+        bubble,
+        contentEl: content,
+        textArea,
+        parser: new StreamParser(),
+        fullContent: '',
+        thinkingEl: null,
+        toolBlocks: [],
+    };
+}
+
+function processStreamEvents(events) {
+    if (!streamState) return;
+
+    for (const event of events) {
+        switch (event.type) {
+            case 'thinking_start': {
+                // Remove cursor from text area
+                streamState.textArea.classList.remove('stream-cursor');
+                
+                const details = document.createElement('details');
+                details.className = 'thinking-block';
+                details.innerHTML = `
+                    <summary>
+                        <span class="thinking-indicator"></span>
+                        Thinking...
+                    </summary>
+                    <div class="thinking-content"></div>`;
+                streamState.contentEl.insertBefore(details, streamState.textArea);
+                streamState.thinkingEl = details.querySelector('.thinking-content');
+                break;
+            }
+
+            case 'thinking':
+                if (streamState.thinkingEl) {
+                    streamState.thinkingEl.textContent += event.text;
+                }
+                break;
+
+            case 'thinking_end': {
+                if (streamState.thinkingEl) {
+                    // Mark as complete
+                    const indicator = streamState.thinkingEl.closest('.thinking-block').querySelector('.thinking-indicator');
+                    if (indicator) indicator.classList.add('done');
+                }
+                streamState.thinkingEl = null;
+                streamState.textArea.classList.add('stream-cursor');
+                break;
+            }
+
+            case 'content':
+                streamState.textArea.textContent += event.text;
+                break;
         }
-    } finally {
-        setLoading(false);
-        currentController = null;
     }
+
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function addToolCallBlock(name, args) {
+    if (!streamState) return;
+
+    // Remove cursor
+    streamState.textArea.classList.remove('stream-cursor');
+
+    const block = document.createElement('details');
+    block.className = 'tool-call-block';
+    block.innerHTML = `
+        <summary>
+            <span class="tool-indicator running"></span>
+            Calling <code>${escapeHtml(name)}</code>...
+        </summary>
+        <div class="tool-call-content">
+            <div class="tool-section-label">Arguments</div>
+            <pre><code>${escapeHtml(JSON.stringify(args, null, 2))}</code></pre>
+            <div class="tool-result-area" style="display:none">
+                <div class="tool-section-label">Result</div>
+                <pre><code class="tool-result-code"></code></pre>
+            </div>
+        </div>`;
+
+    streamState.contentEl.insertBefore(block, streamState.textArea);
+    streamState.toolBlocks.push({ name, element: block, hasResult: false });
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function updateToolResultBlock(name, result) {
+    if (!streamState) return;
+
+    const match = [...streamState.toolBlocks].reverse().find(t => t.name === name && !t.hasResult);
+    if (match) {
+        match.hasResult = true;
+        const block = match.element;
+
+        // Update indicator
+        const indicator = block.querySelector('.tool-indicator');
+        const isError = result.includes('"status": "error"') || result.includes('Error');
+        indicator.classList.remove('running');
+        indicator.classList.add(isError ? 'error' : 'done');
+
+        // Update summary text
+        const summary = block.querySelector('summary');
+        summary.innerHTML = `
+            <span class="tool-indicator ${isError ? 'error' : 'done'}"></span>
+            <code>${escapeHtml(name)}</code> — ${isError ? 'failed' : 'completed'}`;
+
+        // Show result
+        const resultArea = block.querySelector('.tool-result-area');
+        resultArea.style.display = '';
+        block.querySelector('.tool-result-code').textContent = result;
+
+        // Detect and render images in result
+        detectAndRenderImages(result, resultArea);
+    }
+
+    // Re-add cursor to text area for next content
+    streamState.textArea.classList.add('stream-cursor');
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function detectAndRenderImages(text, container) {
+    // Match common image paths in tool output
+    const imgRegex = /\/workspace\/([\w\-\.\/]+\.(png|jpg|jpeg|gif|svg|webp))/gi;
+    let match;
+    while ((match = imgRegex.exec(text)) !== null) {
+        const imgPath = match[1];
+        const img = document.createElement('img');
+        img.src = `/workspace/file/${encodeURIComponent(imgPath)}`;
+        img.className = 'chat-image';
+        img.alt = imgPath;
+        img.onclick = () => openLightbox(img.src);
+        container.appendChild(img);
+    }
+}
+
+function openLightbox(src) {
+    const lb = document.createElement('div');
+    lb.className = 'image-lightbox';
+    lb.innerHTML = `<img src="${src}" alt="Full size preview">`;
+    lb.onclick = () => lb.remove();
+    document.body.appendChild(lb);
+}
+
+function finalizeStream() {
+    if (!streamState) return;
+
+    // Flush remaining parser buffer
+    processStreamEvents(streamState.parser.flush());
+
+    // Remove streaming cursor
+    streamState.textArea.classList.remove('stream-cursor');
+
+    // Get the raw text content
+    const rawText = streamState.textArea.textContent.trim();
+
+    if (rawText) {
+        // Replace raw text with rendered markdown
+        const rendered = DOMPurify.sanitize(marked.parse(rawText));
+        const mdDiv = document.createElement('div');
+        mdDiv.className = 'rendered-content';
+        mdDiv.innerHTML = rendered;
+        streamState.textArea.replaceWith(mdDiv);
+
+        // Syntax highlighting
+        mdDiv.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+
+        // Add "Run Script" buttons
+        mdDiv.querySelectorAll('pre').forEach(pre => {
+            const codeEl = pre.querySelector('code');
+            if (!codeEl) return;
+            const lang = (codeEl.className.match(/language-(\w+)/) || [])[1] || 'python';
+            if (!['python', 'py', 'bash', 'sh', 'javascript', 'js'].includes(lang)) return;
+            const btn = document.createElement('button');
+            btn.className = 'run-script-btn';
+            btn.innerHTML = '<i class="fas fa-play" style="margin-right:3px"></i>Run';
+            btn.title = `Run this ${lang} snippet in the sandbox`;
+            btn.onclick = () => runCodeBlock(codeEl.textContent, lang, pre);
+            pre.style.position = 'relative';
+            pre.appendChild(btn);
+        });
+
+        // Detect images in rendered markdown
+        mdDiv.querySelectorAll('img').forEach(img => {
+            img.classList.add('chat-image');
+            img.onclick = () => openLightbox(img.src);
+        });
+    } else {
+        streamState.textArea.remove();
+    }
+
+    streamState = null;
+    setLoading(false);
+
+    // Refresh workspace (agent may have created/changed files)
+    refreshWorkspace();
+    fetchConversations();
 }
 
 function setLoading(loading) {
@@ -304,93 +635,71 @@ function setLoading(loading) {
 
     if (loading) {
         stopBtnContainer.classList.remove('hidden');
-
-        // Guard: never create more than one interval
         if (!statusInterval) {
             statusInterval = setInterval(fetchStatus, 1000);
         }
-
-        const loader = document.createElement('div');
-        loader.id        = 'ai-loading';
-        loader.className = 'flex justify-start text-xs text-gray-500 italic loading-dots my-2';
-        loader.setAttribute('aria-live', 'polite');
-        loader.textContent = 'Agent is processing';
-        chatContainer.appendChild(loader);
     } else {
         stopBtnContainer.classList.add('hidden');
         clearInterval(statusInterval);
         statusInterval = null;
-
-        document.getElementById('ai-loading')?.remove();
         userInput.focus();
     }
     chatContainer.scrollTop = chatContainer.scrollHeight;
 }
 
+async function fetchStatus() {
+    try {
+        const r = await apiFetch('/status');
+        if (!r.ok) return;
+    } catch (e) { /* non-fatal */ }
+}
+
 async function stopGeneration() {
     if (!isGenerating) return;
-    currentController?.abort();
     if (currentAudio) currentAudio.pause();
     try {
         await apiFetch('/stop', { method: 'POST' });
     } catch (e) {
         console.error('Stop signal failed:', e);
     }
+    if (streamState) finalizeStream();
+    setLoading(false);
 }
 
 // =============================================================================
-// 7. RENDERING
+// 7. RENDER (for non-streamed messages: user bubbles, legacy)
 // =============================================================================
-function escapeHtml(str) {
-    return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
-
 function renderMessage(role, text, audioUrl = null) {
     const div = document.createElement('div');
     div.className = role === 'user' ? 'flex justify-end' : 'flex justify-start relative group';
 
     let content = text;
     if (role === 'ai') {
-        // Strip raw tool output blocks
         content = content.replace(/### \[TOOL_OUTPUT\] ###[\s\S]*?### \[END_OUTPUT\] ###/g, '');
-        // Render <think> tags as collapsible reasoning blocks
         content = content.replace(
             /<think>([\s\S]*?)<\/think>/g,
-            `<details class="mb-4 bg-gray-900/50 p-3 rounded-lg border border-gray-800">
-                <summary class="text-xs text-blue-400 font-bold uppercase tracking-widest cursor-pointer">Internal Reasoning</summary>
-                <div class="text-[11px] text-gray-400 mt-2 font-mono whitespace-pre-wrap leading-relaxed border-t border-gray-800 pt-2">$1</div>
+            `<details class="thinking-block">
+                <summary><span class="thinking-indicator done"></span>Internal Reasoning</summary>
+                <div class="thinking-content">$1</div>
              </details>`
         );
-        // Parse markdown then sanitize — order matters
         content = DOMPurify.sanitize(marked.parse(content));
     }
 
-    let ttsHtml = '';
-    if (role === 'ai' && audioUrl) {
-        ttsHtml = `
-            <button onclick="toggleAudio('${audioUrl}', this)" 
-                class="tts-button absolute top-2 right-2 p-1.5 rounded-lg bg-gray-800/80 border border-gray-700 text-blue-400 hover:text-white hover:bg-blue-600 transition-all shadow-md opacity-0 group-hover:opacity-100 focus:opacity-100 z-10"
-                title="Play/Pause Audio">
-                <i class="fas fa-play text-[10px]"></i>
-            </button>`;
-    }
-
     div.innerHTML = `
-        <div class="${role === 'user' ? 'bg-blue-600' : 'bg-[#161b22] border border-gray-800'}
+        <div class="${role === 'user' ? 'bg-blue-600' : 'ai-message bg-[#161b22] border border-gray-800'}
                      max-w-[85%] rounded-2xl px-5 py-4 shadow-xl mb-4 relative overflow-hidden group"
              role="${role === 'ai' ? 'article' : 'none'}">
-            ${ttsHtml}
             <div class="markdown-body">${content}</div>
         </div>`;
 
     chatContainer.appendChild(div);
     div.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
 
-    // Add "Run Script" button to code blocks
+    if (role === 'ai' && audioUrl) {
+        addTtsButton(div.querySelector('.ai-message'), audioUrl);
+    }
+
     div.querySelectorAll('pre').forEach(pre => {
         const codeEl = pre.querySelector('code');
         if (!codeEl) return;
@@ -404,33 +713,31 @@ function renderMessage(role, text, audioUrl = null) {
         pre.style.position = 'relative';
         pre.appendChild(btn);
     });
-    
-    // Maintain only the last 5 TTS buttons as active links to audio
-    const allTtsButtons = document.querySelectorAll('.tts-button');
-    if (allTtsButtons.length > 5) {
-        for (let i = 0; i < allTtsButtons.length - 5; i++) {
-            allTtsButtons[i].classList.add('hidden');
-        }
-    }
 
     chatContainer.scrollTop = chatContainer.scrollHeight;
 }
 
+function addTtsButton(msgEl, audioUrl) {
+    if (!msgEl) return;
+    const btn = document.createElement('button');
+    btn.className = 'tts-button absolute top-2 right-2 p-1.5 rounded-lg bg-gray-800/80 border border-gray-700 text-blue-400 hover:text-white hover:bg-blue-600 transition-all shadow-md opacity-0 group-hover:opacity-100 focus:opacity-100 z-10';
+    btn.title = 'Play/Pause Audio';
+    btn.innerHTML = '<i class="fas fa-play text-[10px]"></i>';
+    btn.onclick = () => toggleAudio(audioUrl, btn);
+    msgEl.appendChild(btn);
+}
+
 function toggleAudio(url, btn) {
     const icon = btn.querySelector('i');
-    
-    // If clicking a new audio source
     if (!currentAudio || currentAudio.src.indexOf(url) === -1) {
         if (currentAudio) {
             currentAudio.pause();
-            // Reset previous button if it exists
             const prevBtn = document.querySelector('.tts-button i.fa-pause');
             if (prevBtn) {
                 prevBtn.classList.replace('fa-pause', 'fa-play');
                 prevBtn.parentElement.classList.remove('bg-blue-600/20', 'border-blue-500');
             }
         }
-        
         currentAudio = new Audio(url);
         currentAudio.onended = () => {
             icon.classList.replace('fa-pause', 'fa-play');
@@ -440,7 +747,6 @@ function toggleAudio(url, btn) {
         icon.classList.replace('fa-play', 'fa-pause');
         btn.classList.add('bg-blue-600/20', 'border-blue-500');
     } else {
-        // Toggling same audio
         if (currentAudio.paused) {
             currentAudio.play();
             icon.classList.replace('fa-play', 'fa-pause');
@@ -454,18 +760,141 @@ function toggleAudio(url, btn) {
 }
 
 // =============================================================================
-// 8. AUDIT LOG — scroll-preserving, change-detecting poll
+// 8. CURRENT MODEL DISPLAY
+// =============================================================================
+async function fetchModels() {
+    try {
+        const r = await apiFetch('/models');
+        if (!r.ok) return;
+        const { current } = await r.json();
+        const display = document.getElementById('current-model-display');
+        if (display) {
+            display.textContent = current || 'No model loaded';
+        }
+    } catch (e) { console.error('Model fetch failed:', e); }
+}
+
+// =============================================================================
+// 9. CONVERSATION MANAGEMENT
+// =============================================================================
+async function fetchConversations() {
+    try {
+        const r = await apiFetch('/conversations');
+        if (!r.ok) return;
+        const { conversations, current } = await r.json();
+        const list = document.getElementById('conversation-list');
+
+        if (!conversations.length) {
+            list.innerHTML = '<div class="text-[10px] text-gray-600 italic text-center pt-4">No conversations yet.</div>';
+            return;
+        }
+
+        list.innerHTML = '';
+        conversations.forEach(conv => {
+            const div = document.createElement('div');
+            div.className = `conv-item ${conv.id === current ? 'active' : ''}`;
+            div.setAttribute('role', 'listitem');
+
+            const timeAgo = formatTimeAgo(conv.updated_at);
+            div.innerHTML = `
+                <div class="conv-title">${escapeHtml(conv.title)}</div>
+                <div class="conv-meta">${conv.message_count} messages · ${timeAgo}</div>
+                <button class="conv-delete" onclick="event.stopPropagation(); deleteConversation('${conv.id}', ${conv.id === current})" title="Delete">
+                    <i class="fas fa-trash"></i>
+                </button>`;
+
+            div.onclick = () => loadConversation(conv.id);
+            list.appendChild(div);
+        });
+    } catch (e) { console.error('Conversation fetch failed:', e); }
+}
+
+async function createNewConversation() {
+    try {
+        await apiFetch('/conversations', { method: 'POST' });
+        chatContainer.innerHTML = `
+            <div class="flex justify-center my-4 opacity-50 text-sm text-gray-500 italic">
+                Agent initialized. Awaiting tasks...
+            </div>`;
+        fetchConversations();
+        fetchHistory();
+    } catch (e) { console.error('New conversation failed:', e); }
+}
+
+async function loadConversation(convId) {
+    try {
+        const r = await apiFetch(`/conversations/${convId}`, { method: 'PUT' });
+        if (!r.ok) return;
+        const { history } = await r.json();
+
+        chatContainer.innerHTML = '';
+        history.forEach(msg => {
+            renderMessage(msg.role === 'user' ? 'user' : 'ai', msg.content);
+        });
+
+        fetchConversations();
+        fetchHistory();
+    } catch (e) { console.error('Load conversation failed:', e); }
+}
+
+async function deleteConversation(convId, isActive) {
+    if (!confirm('Delete this conversation?')) return;
+    try {
+        await apiFetch(`/conversations/${convId}`, { method: 'DELETE' });
+        if (isActive) {
+            chatContainer.innerHTML = `
+                <div class="flex justify-center my-4 opacity-50 text-sm text-gray-500 italic">
+                    Agent initialized. Awaiting tasks...
+                </div>`;
+            fetchHistory();
+        }
+        fetchConversations();
+    } catch (e) { console.error('Delete conversation failed:', e); }
+}
+
+function formatTimeAgo(isoDate) {
+    if (!isoDate) return '';
+    const diff = Date.now() - new Date(isoDate).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days}d ago`;
+}
+
+// =============================================================================
+// 10. LEFT SIDEBAR TABS
+// =============================================================================
+function switchLeftTab(tab) {
+    const isConvos = tab === 'convos';
+    document.getElementById('panel-convos').classList.toggle('hidden', !isConvos);
+    document.getElementById('panel-files').classList.toggle('hidden', isConvos);
+
+    const tabConvos = document.getElementById('tab-convos');
+    const tabFiles = document.getElementById('tab-files');
+    tabConvos.classList.toggle('text-blue-400', isConvos);
+    tabConvos.classList.toggle('border-blue-500', isConvos);
+    tabConvos.classList.toggle('text-gray-500', !isConvos);
+    tabConvos.classList.toggle('border-transparent', !isConvos);
+
+    tabFiles.classList.toggle('text-blue-400', !isConvos);
+    tabFiles.classList.toggle('border-blue-500', !isConvos);
+    tabFiles.classList.toggle('text-gray-500', isConvos);
+    tabFiles.classList.toggle('border-transparent', isConvos);
+}
+
+// =============================================================================
+// 11. AUDIT LOG
 // =============================================================================
 async function fetchAudit() {
     try {
         const r = await apiFetch('/audit');
         if (!r.ok) return;
         const { log, mtime } = await r.json();
-
-        // Skip DOM update if nothing changed
         if (mtime && mtime === _auditCache.mtime) return;
         _auditCache = { mtime, log };
-
         const atBottom = systemTerminal.scrollHeight - systemTerminal.scrollTop
                          <= systemTerminal.clientHeight + 10;
         systemTerminal.textContent = log;
@@ -474,49 +903,23 @@ async function fetchAudit() {
 }
 
 // =============================================================================
-// 9. BOOTSTRAP INFO
+// 12. BOOTSTRAP INFO
 // =============================================================================
 async function fetchInfo() {
     try {
         const r = await apiFetch('/info');
         if (!r.ok) return;
-        const { model, container } = await r.json();
-        document.getElementById('model-name').textContent     = model;
+        const { container } = await r.json();
         document.getElementById('container-name').textContent = container;
-        document.getElementById('model-badge').classList.remove('hidden');
         document.getElementById('container-badge').classList.remove('hidden');
     } catch (e) { /* non-fatal */ }
 }
 
 // =============================================================================
-// 10. EVENT LISTENERS
-// =============================================================================
-userInput.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
-    }
-});
-
-userInput.addEventListener('input', () => {
-    requestAnimationFrame(() => {
-        userInput.style.height = 'auto';
-        userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
-    });
-    popup.classList.toggle('hidden', !userInput.value.startsWith('/'));
-});
-
-window.addEventListener('resize', () => {
-    fitAddon.fit();
-    editor.resize();
-});
-
-// =============================================================================
-// 12. HISTORY PANEL
+// 13. RIGHT SIDEBAR TABS
 // =============================================================================
 function switchTab(tab) {
     const isHistory = tab === 'history';
-
     document.getElementById('panel-history').classList.toggle('hidden', !isHistory);
     document.getElementById('panel-audit').classList.toggle('hidden', isHistory);
 
@@ -551,7 +954,6 @@ async function fetchHistory() {
                     ${isUser ? '<i class="fas fa-user mr-1"></i>You' : '<i class="fas fa-robot mr-1"></i>Agent'}
                 </div>
                 <div class="truncate opacity-80">${escapeHtml(msg.content.slice(0, 120))}${msg.content.length > 120 ? '…' : ''}</div>`;
-            // Click to copy message into input
             div.onclick = () => { userInput.value = msg.content; userInput.focus(); };
             list.appendChild(div);
         });
@@ -559,46 +961,31 @@ async function fetchHistory() {
     } catch (e) { /* non-fatal */ }
 }
 
-async function saveHistory() {
-    try {
-        const r = await apiFetch('/chat', {
-            method: 'POST',
-            body: JSON.stringify({ query: '/save' }),
-        });
-        const { answer } = await r.json();
-        alert(answer);
-    } catch (e) { console.error('Save failed:', e); }
-}
-
-async function loadHistory() {
-    if (!confirm('Load previous session? This will replace current history.')) return;
-    try {
-        const r = await apiFetch('/chat', {
-            method: 'POST',
-            body: JSON.stringify({ query: '/load' }),
-        });
-        const { answer } = await r.json();
-        renderMessage('ai', answer);
-        fetchHistory();
-    } catch (e) { console.error('Load failed:', e); }
-}
-window.addEventListener('load', () => {
-    userInput.focus();
-    setTimeout(() => { fitAddon.fit(); editor.resize(); }, 500);
+// =============================================================================
+// 14. EVENT LISTENERS
+// =============================================================================
+userInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
 });
 
-fetchInfo();
-fetchAudit();
-fetchHistory();
-refreshWorkspace();
+userInput.addEventListener('input', () => {
+    requestAnimationFrame(() => {
+        userInput.style.height = 'auto';
+        userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
+    });
+    popup.classList.toggle('hidden', !userInput.value.startsWith('/'));
+});
 
-setInterval(fetchInfo,        15_000);
-setInterval(fetchAudit,        3_000);
-setInterval(fetchHistory,      5_000);
-setInterval(refreshWorkspace, 30_000);
+window.addEventListener('resize', () => {
+    fitAddon.fit();
+    editor.resize();
+});
 
 // =============================================================================
-// 13. DARK MODE TOGGLE
+// 15. DARK MODE
 // =============================================================================
 function toggleDarkMode() {
     document.body.classList.toggle('light-mode');
@@ -612,7 +999,6 @@ function toggleDarkMode() {
     }
 }
 
-// Restore theme on load
 if (localStorage.getItem('theme') === 'light') {
     document.body.classList.add('light-mode');
     const icon = document.querySelector('#dark-mode-toggle i');
@@ -620,17 +1006,13 @@ if (localStorage.getItem('theme') === 'light') {
 }
 
 // =============================================================================
-// 14. HISTORY EXPORT
+// 16. EXPORT & RUN SCRIPT
 // =============================================================================
 function exportHistory() {
     window.location.href = '/export';
 }
 
-// =============================================================================
-// 15. RUN CODE BLOCK
-// =============================================================================
 async function runCodeBlock(code, language, preElement) {
-    // Show a loading state on the button
     const btn = preElement.querySelector('.run-script-btn');
     if (btn) {
         btn.innerHTML = '<i class="fas fa-spinner fa-spin" style="margin-right:3px"></i>Running...';
@@ -644,11 +1026,9 @@ async function runCodeBlock(code, language, preElement) {
         });
         const { output } = await r.json();
 
-        // Remove any previous output block
         const existing = preElement.parentElement.querySelector('.script-output');
         if (existing) existing.remove();
 
-        // Create output block
         const outDiv = document.createElement('div');
         outDiv.className = 'script-output';
         outDiv.textContent = output || '[NO OUTPUT]';
@@ -662,3 +1042,20 @@ async function runCodeBlock(code, language, preElement) {
         }
     }
 }
+
+// =============================================================================
+// 17. BOOTSTRAP
+// =============================================================================
+window.addEventListener('load', () => {
+    userInput.focus();
+    setTimeout(() => { fitAddon.fit(); editor.resize(); }, 500);
+});
+
+fetchInfo();
+fetchModels();
+fetchAudit();
+fetchHistory();
+fetchConversations();
+refreshWorkspace();
+
+setInterval(fetchModels,          30_000);
