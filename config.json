@@ -1,0 +1,12 @@
+{
+    "max_tokens": 4096,
+    "max_iterations": 15,
+    "temperature": 0.1,
+    "hard_limit": false,
+    "timeout": 300,
+    "audio_cache": {
+        "max_files": 5,
+        "max_size_mb": 100
+    },
+    "gpu": true
+}

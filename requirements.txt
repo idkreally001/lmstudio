@@ -1,0 +1,8 @@
+flask>=3.0,<4.0
+flask-socketio>=5.3,<6.0
+requests>=2.31,<3.0
+edge-tts>=6.1,<7.0
+emoji>=2.8,<3.0
+psycopg2-binary>=2.9,<3.0
+pyyaml>=6.0,<7.0
+duckduckgo-search>=4.0,<6.0

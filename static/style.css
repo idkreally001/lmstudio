@@ -1,0 +1,183 @@
+/* --- CSS Custom Properties for Dark Mode --- */
+:root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-tertiary: #050505;
+    --border-color: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --accent-blue: #58a6ff;
+    --accent-green: #3fb950;
+    --accent-red: #f85149;
+    --accent-purple: #bc8cff;
+}
+
+/* Light mode overrides */
+body.light-mode {
+    --bg-primary: #ffffff;
+    --bg-secondary: #f6f8fa;
+    --bg-tertiary: #f0f2f5;
+    --border-color: #d0d7de;
+    --text-primary: #1f2328;
+    --text-secondary: #656d76;
+}
+
+body.light-mode { background-color: var(--bg-primary); color: var(--text-primary); }
+body.light-mode header,
+body.light-mode .bg-\[\\#161b22\] { background-color: var(--bg-secondary) !important; }
+body.light-mode aside { background-color: var(--bg-primary) !important; }
+body.light-mode #chat-container { background-color: var(--bg-primary) !important; }
+body.light-mode .markdown-body pre { background: #f6f8fa !important; border-color: #d0d7de !important; }
+body.light-mode .ace_editor { background-color: #fff !important; color: #24292f !important; }
+body.light-mode .ace_gutter { background: #f6f8fa !important; color: #636c76 !important; }
+body.light-mode #terminal { background-color: #1e1e2e !important; }
+
+/* --- Global UI & Scrollbars --- */
+.custom-scrollbar::-webkit-scrollbar { width: 6px; }
+.custom-scrollbar::-webkit-scrollbar-track { background: var(--bg-primary); }
+.custom-scrollbar::-webkit-scrollbar-thumb { background: #444; border-radius: 10px; }
+.custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #666; }
+
+#chat-container { scroll-behavior: smooth; }
+.terminal-font { font-family: 'Fira Code', 'Courier New', monospace; line-height: 1.4; }
+
+/* --- Markdown Styling --- */
+.markdown-body ul { list-style-type: disc; padding-left: 1.5rem; margin-bottom: 1rem; }
+.markdown-body p { margin-bottom: 1rem; }
+.markdown-body pre { 
+    background: #0d1117; 
+    padding: 1rem; 
+    border-radius: 0.5rem; 
+    border: 1px solid #30363d; 
+    margin-bottom: 1rem; 
+    position: relative; 
+}
+
+/* --- IDE Pane & Ace Editor Layout --- */
+#editor { 
+    width: 100%;
+    height: 100%;
+    font-size: 13px;
+}
+
+#editor-pane {
+    width: 0;
+    overflow: hidden;
+    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+#editor-pane.active {
+    width: 45%;
+    border-left: 1px solid #30363d;
+}
+
+/* Ace Editor Theme Overrides to match GitHub Dark */
+.ace_editor {
+    background-color: #0d1117 !important;
+    color: #c9d1d9 !important;
+}
+.ace_gutter {
+    background: #161b22 !important;
+    color: #484f58 !important;
+}
+.ace_active-line { background: #21262d !important; }
+.ace_print-margin { display: none; }
+
+/* --- Terminal Styling --- */
+#terminal {
+    background-color: #000;
+    height: 100%;
+}
+
+#terminal-pane {
+    transition: height 0.3s ease;
+}
+
+#terminal-pane.collapsed {
+    height: 30px;
+}
+
+/* --- TTS Button Tooltip --- */
+.tts-button {
+    position: relative;
+}
+
+.tts-button::after {
+    content: 'Play / Pause Audio';
+    position: absolute;
+    bottom: 120%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #21262d;
+    color: #e6edf3;
+    font-size: 9px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+    border: 1px solid #30363d;
+    z-index: 100;
+}
+
+.tts-button:hover::after {
+    opacity: 1;
+}
+
+/* --- Run Script Button (inside code blocks) --- */
+.run-script-btn {
+    position: absolute;
+    top: 6px;
+    right: 40px;
+    font-size: 9px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: #238636;
+    color: #fff;
+    border: 1px solid #2ea043;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease, background 0.15s ease;
+    z-index: 10;
+}
+
+.run-script-btn:hover {
+    background: #2ea043;
+}
+
+.markdown-body pre:hover .run-script-btn {
+    opacity: 1;
+}
+
+/* --- Utilities & Animations --- */
+.transition-all {
+    transition: all 0.3s ease-in-out;
+}
+
+.loading-dots:after { 
+    content: ' .'; 
+    animation: dots 1.5s steps(5, end) infinite; 
+}
+
+@keyframes dots { 
+    0%, 20% { content: ' .'; } 
+    40% { content: ' ..'; } 
+    60% { content: ' ...'; } 
+    80%, 100% { content: ''; } 
+}
+
+/* --- Script Output Block --- */
+.script-output {
+    background: #0d1117;
+    border: 1px solid #238636;
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-top: 6px;
+    font-family: 'Fira Code', monospace;
+    font-size: 11px;
+    color: #3fb950;
+    white-space: pre-wrap;
+    max-height: 200px;
+    overflow-y: auto;
+}

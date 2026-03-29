@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Research Sandbox | IDE</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link rel="icon" href="{{ url_for('static', filename='favicon.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/ace.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/ext-language_tools.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body class="bg-[#0d1117] text-gray-200 h-screen flex flex-col overflow-hidden">
+
+    <!-- Confirm Wipe Modal -->
+    <div id="confirm-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] items-center justify-center transition-opacity duration-200"
+         role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="bg-[#161b22] border border-gray-700 rounded-xl p-6 max-w-sm w-full shadow-2xl">
+            <h3 id="modal-title" class="text-lg font-bold text-red-400 mb-2">
+                <i class="fas fa-exclamation-triangle mr-2" aria-hidden="true"></i><span id="modal-header-text">Wipe Environment</span>
+            </h3>
+            <p id="modal-body-text" class="text-sm text-gray-400 mb-6">
+                Are you sure you want to completely wipe the agent's context and history? This action cannot be undone.
+            </p>
+            <div class="flex justify-end gap-3">
+                <button id="modal-cancel-btn" onclick="closeModal()"
+                    class="px-4 py-2 rounded text-sm text-gray-300 hover:bg-gray-800 transition border border-transparent hover:border-gray-700">
+                    Cancel
+                </button>
+                <button onclick="confirmClear()"
+                    class="px-4 py-2 rounded text-sm bg-red-600 hover:bg-red-500 text-white transition shadow-lg shadow-red-900/20 font-medium">
+                    Yes, Wipe It
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Header -->
+    <header class="border-b border-gray-800 p-3 flex justify-between items-center bg-[#161b22] z-40">
+        <div class="flex items-center gap-4">
+            <div class="flex items-center gap-2">
+                <i class="fas fa-microchip text-blue-500 text-xl" aria-hidden="true"></i>
+                <h1 class="font-bold text-md tracking-tight">RESEARCH_AGENT</h1>
+            </div>
+            <div id="status-badges" class="flex gap-2" aria-live="polite">
+                <div id="model-badge" class="bg-blue-900/20 text-blue-400 text-[10px] px-2 py-1 rounded border border-blue-800/50 font-mono hidden">
+                    <i class="fas fa-brain mr-1" aria-hidden="true"></i>
+                    <span id="model-name">...</span>
+                </div>
+                <div id="container-badge" class="bg-green-900/20 text-green-400 text-[10px] px-2 py-1 rounded border border-green-800/50 font-mono hidden">
+                    <i class="fas fa-box mr-1" aria-hidden="true"></i>
+                    <span id="container-name">...</span>
+                </div>
+            </div>
+        </div>
+        <nav class="flex gap-2" aria-label="Workspace actions">
+            <button onclick="toggleDarkMode()" id="dark-mode-toggle"
+                class="hover:bg-gray-700 px-3 py-1 rounded text-xs transition border border-gray-700 text-gray-300"
+                aria-label="Toggle dark mode" title="Toggle Dark Mode">
+                <i class="fas fa-moon text-purple-400" aria-hidden="true"></i>
+            </button>
+            <button onclick="exportHistory()"
+                class="hover:bg-gray-700 px-3 py-1 rounded text-xs transition border border-gray-700 text-gray-300"
+                aria-label="Export audit log as Markdown" title="Export History (.md)">
+                <i class="fas fa-download mr-2 text-emerald-400" aria-hidden="true"></i>Export
+            </button>
+            <button onclick="applyCommand('/save')"
+                class="hover:bg-gray-700 px-3 py-1 rounded text-xs transition border border-gray-700 text-gray-300"
+                aria-label="Save workspace" title="Save session">
+                <i class="fas fa-save mr-2 text-blue-400" aria-hidden="true"></i>Save
+            </button>
+            <button onclick="loadHistory()"
+                class="hover:bg-gray-700 px-3 py-1 rounded text-xs transition border border-gray-700 text-gray-300"
+                aria-label="Load previous session" title="Load session">
+                <i class="fas fa-upload mr-2 text-green-400" aria-hidden="true"></i>Load
+            </button>
+            <button onclick="applyCommand('/clear')"
+                class="hover:bg-gray-700 px-3 py-1 rounded text-xs transition border border-gray-700 text-gray-300"
+                aria-label="Clear chat history" title="Clear chat context">
+                <i class="fas fa-eraser mr-2 text-blue-400" aria-hidden="true"></i>Clear Chat
+            </button>
+            <button onclick="applyCommand('/reset')"
+                class="text-red-400 hover:bg-red-900/30 px-3 py-1 rounded text-xs transition border border-red-900/30"
+                aria-label="Reset environment" title="Wipe /workspace">
+                <i class="fas fa-trash-alt mr-2" aria-hidden="true"></i>Reset Env
+            </button>
+        </nav>
+    </header>
+
+    <div class="flex flex-1 overflow-hidden">
+
+        <!-- File Explorer Sidebar -->
+        <aside class="w-64 border-r border-gray-800 bg-[#0d1117] flex flex-col" aria-label="File explorer">
+            <div class="p-3 border-b border-gray-800 flex justify-between items-center text-[10px] font-bold uppercase text-gray-500 tracking-widest bg-[#161b22]">
+                File Explorer
+                <button onclick="refreshWorkspace()" class="hover:text-white transition" aria-label="Refresh file explorer">
+                    <i class="fas fa-sync-alt" aria-hidden="true"></i>
+                </button>
+            </div>
+            <div id="workspace-tree"
+                class="p-4 font-mono text-[11px] overflow-y-auto custom-scrollbar flex-1 whitespace-pre text-blue-300"
+                role="tree" aria-label="Workspace files">
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="flex-1 flex flex-col relative bg-[#0d1117] overflow-hidden">
+
+            <div class="flex-1 flex overflow-hidden">
+
+                <!-- Chat Panel -->
+                <div id="chat-container"
+                    class="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar pb-32"
+                    role="log" aria-live="polite" aria-label="Conversation history">
+                    <div class="flex justify-center my-4 opacity-50 text-sm text-gray-500 italic">
+                        Agent initialized. Awaiting tasks...
+                    </div>
+                </div>
+
+                <!-- Editor Pane -->
+                <div id="editor-pane" class="w-0 border-l border-gray-800 transition-all duration-300 flex flex-col bg-[#0d1117]"
+                     aria-label="Code editor">
+                    <div class="p-2 border-b border-gray-800 flex justify-between items-center bg-[#161b22]">
+                        <span id="current-file-name" class="text-[10px] font-mono text-blue-400">no file open</span>
+                        <div class="flex gap-2">
+                            <button id="editor-save-btn" onclick="saveCurrentFile()"
+                                class="text-[10px] bg-blue-600 px-2 py-1 rounded hover:bg-blue-500 transition"
+                                aria-label="Save current file">
+                                Save
+                            </button>
+                            <button onclick="toggleEditor()"
+                                class="text-[10px] text-gray-400 hover:text-white"
+                                aria-label="Close editor">
+                                <i class="fas fa-times" aria-hidden="true"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div id="editor" aria-label="File editor"></div>
+                </div>
+            </div>
+
+            <!-- Terminal Pane -->
+            <div id="terminal-pane" class="h-48 border-t border-gray-800 bg-black flex flex-col transition-all">
+                <div class="p-1 border-b border-gray-800 flex items-center bg-[#161b22] px-3">
+                    <span class="text-[9px] font-bold uppercase text-gray-500 tracking-widest">Interactive Terminal</span>
+                    <button onclick="toggleTerminal()" id="terminal-toggle-btn"
+                        class="ml-auto text-gray-500 hover:text-white transition"
+                        aria-label="Toggle terminal panel"
+                        aria-expanded="true">
+                        <i class="fas fa-chevron-down" aria-hidden="true"></i>
+                    </button>
+                </div>
+                <div id="terminal" class="flex-1 p-2 overflow-hidden" aria-label="Interactive terminal"></div>
+            </div>
+
+            <!-- Input Overlay -->
+            <div id="input-overlay" class="absolute bottom-48 left-0 right-0 p-4 bg-gradient-to-t from-[#0d1117] via-[#0d1117] to-transparent z-10 transition-all">
+                <div class="max-w-4xl mx-auto relative">
+
+                    <!-- Stop Button -->
+                    <div id="stop-btn-container" class="hidden absolute -top-14 left-1/2 transform -translate-x-1/2 z-50">
+                        <button onclick="stopGeneration()"
+                            class="bg-[#161b22] border border-gray-600 hover:border-red-500 hover:bg-red-900/20 text-gray-300 px-4 py-2 rounded-full text-xs font-bold tracking-wider uppercase flex items-center gap-2 transition shadow-lg shadow-black/50 group"
+                            aria-label="Stop generation">
+                            <i class="fas fa-stop-circle text-red-500 group-hover:animate-pulse" aria-hidden="true"></i>
+                            Stop Generating
+                        </button>
+                    </div>
+
+                    <!-- Command Popup -->
+                    <div id="command-popup" class="hidden absolute bottom-full mb-2 left-0 w-64 bg-[#161b22] border border-gray-700 rounded-lg shadow-2xl z-50 overflow-hidden"
+                         role="listbox" aria-label="Available commands">
+                        <div class="p-2 text-[10px] uppercase text-gray-500 border-b border-gray-800 font-bold bg-[#0d1117]">Commands</div>
+                        <div class="command-item p-3 hover:bg-gray-700 cursor-pointer text-sm flex items-center transition"
+                             role="option" tabindex="0" onclick="applyCommand('/save')"
+                             onkeydown="if(event.key==='Enter') applyCommand('/save')">
+                            <i class="fas fa-save mr-3 w-4 text-blue-400" aria-hidden="true"></i>
+                            <span>/save</span>
+                            <span class="text-[9px] opacity-40 ml-auto">Persist</span>
+                        </div>
+                        <div class="command-item p-3 hover:bg-gray-700 cursor-pointer text-sm flex items-center transition"
+                             role="option" tabindex="0" onclick="applyCommand('/clear')"
+                             onkeydown="if(event.key==='Enter') applyCommand('/clear')">
+                            <i class="fas fa-eraser mr-3 w-4 text-blue-400" aria-hidden="true"></i>
+                            <span>/clear</span>
+                            <span class="text-[9px] opacity-40 ml-auto">Reset Chat</span>
+                        </div>
+                        <div class="command-item p-3 hover:bg-red-900/50 cursor-pointer text-sm flex items-center transition"
+                             role="option" tabindex="0" onclick="applyCommand('/reset')"
+                             onkeydown="if(event.key==='Enter') applyCommand('/reset')">
+                            <i class="fas fa-trash-alt mr-3 w-4 text-red-500" aria-hidden="true"></i>
+                            <span class="text-red-400">/reset</span>
+                            <span class="text-[9px] text-red-400 opacity-60 ml-auto">Wipe Env</span>
+                        </div>
+                    </div>
+
+                    <!-- Input -->
+                    <textarea id="user-input" rows="1" autofocus
+                        class="w-full bg-[#161b22] border border-gray-700 rounded-xl px-4 py-4 pr-12 focus:outline-none focus:border-blue-500 resize-none custom-scrollbar shadow-2xl terminal-font transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        placeholder="Type research task or '/' for commands..."
+                        aria-label="Message input"
+                        aria-multiline="true"></textarea>
+
+                    <button id="send-btn" onclick="sendMessage()"
+                        class="absolute right-3 bottom-3 p-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-white transition disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-600"
+                        aria-label="Send message">
+                        <i class="fas fa-paper-plane" aria-hidden="true"></i>
+                    </button>
+                </div>
+            </div>
+        </main>
+
+        <!-- Right Sidebar — History + Audit tabs -->
+        <section class="w-96 border-l border-gray-800 bg-[#050505] flex flex-col" aria-label="Right sidebar">
+            <!-- Tab Headers -->
+            <div class="border-b border-gray-800 bg-[#161b22] flex">
+                <button id="tab-history" onclick="switchTab('history')"
+                    class="flex-1 p-3 text-[10px] font-bold uppercase tracking-widest text-blue-400 border-b-2 border-blue-500 transition"
+                    aria-selected="true" role="tab">
+                    <i class="fas fa-history mr-1" aria-hidden="true"></i> History
+                </button>
+                <button id="tab-audit" onclick="switchTab('audit')"
+                    class="flex-1 p-3 text-[10px] font-bold uppercase tracking-widest text-gray-500 border-b-2 border-transparent hover:text-gray-300 transition"
+                    aria-selected="false" role="tab">
+                    <i class="fas fa-terminal mr-1" aria-hidden="true"></i> Audit Log
+                    <div class="inline-block w-2 h-2 rounded-full bg-green-500 animate-pulse ml-1"></div>
+                </button>
+            </div>
+
+            <!-- History Panel -->
+            <div id="panel-history" class="flex-1 flex flex-col overflow-hidden">
+                <div id="history-list"
+                    class="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-2"
+                    role="list" aria-label="Conversation history">
+                    <div class="text-[10px] text-gray-600 italic text-center pt-4">No history yet.</div>
+                </div>
+            </div>
+
+            <!-- Audit Log Panel -->
+            <div id="panel-audit" class="flex-1 overflow-hidden hidden">
+                <div id="system-terminal"
+                    class="p-4 terminal-font text-[10px] text-gray-400 overflow-y-auto custom-scrollbar h-full whitespace-pre-wrap leading-tight"
+                    role="log" aria-label="Audit log output" aria-live="polite">
+                    Initializing system audit feed...
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
