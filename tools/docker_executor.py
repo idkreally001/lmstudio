@@ -55,5 +55,19 @@ def _exec_docker(command):
     if process.returncode == 0:
         return json.dumps({"status": "ok", "output": stdout or "[NO OUTPUT]"})
     else:
+        # INTERCEPTOR: Catch the specific directory-as-file error
+        if "can't find '__main__' module" in stderr:
+            return json.dumps({
+                "status": "error",
+                "message": "CRITICAL: You tried to run a directory as a file. Check your path for spaces (e.g., '/workspace file.py')."
+            })
+            
+        if "[Errno 2] No such file or directory" in stderr or "No such file or directory" in stderr:
+             # Force the agent to look at the directory before trying again
+             return json.dumps({
+                "status": "error",
+                "message": "File not found. Run 'ls -R /workspace' to see where the file actually is before retrying."
+             })
+
         # Include truncated stdout even on error, as it often contains clues
         return json.dumps({"status": "error", "output": stdout, "message": stderr})

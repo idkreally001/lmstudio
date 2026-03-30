@@ -419,11 +419,6 @@ function createStreamContainer() {
     const content = document.createElement('div');
     content.className = 'stream-content markdown-body';
 
-    // Streaming text area (raw text, will be replaced with markdown on done)
-    const textArea = document.createElement('span');
-    textArea.className = 'stream-text stream-cursor';
-
-    content.appendChild(textArea);
     bubble.appendChild(content);
     wrapper.appendChild(bubble);
     chatContainer.appendChild(wrapper);
@@ -433,12 +428,29 @@ function createStreamContainer() {
         wrapper,
         bubble,
         contentEl: content,
-        textArea,
+        activeTextArea: null,
         parser: new StreamParser(),
-        fullContent: '',
         thinkingEl: null,
         toolBlocks: [],
     };
+}
+
+function ensureActiveTextArea() {
+    if (!streamState) return null;
+    if (!streamState.activeTextArea) {
+        const span = document.createElement('span');
+        span.className = 'stream-text stream-cursor';
+        streamState.contentEl.appendChild(span);
+        streamState.activeTextArea = span;
+    }
+    return streamState.activeTextArea;
+}
+
+function deactivateTextArea() {
+    if (streamState && streamState.activeTextArea) {
+        streamState.activeTextArea.classList.remove('stream-cursor');
+        streamState.activeTextArea = null;
+    }
 }
 
 function processStreamEvents(events) {
@@ -447,8 +459,7 @@ function processStreamEvents(events) {
     for (const event of events) {
         switch (event.type) {
             case 'thinking_start': {
-                // Remove cursor from text area
-                streamState.textArea.classList.remove('stream-cursor');
+                deactivateTextArea();
                 
                 const details = document.createElement('details');
                 details.className = 'thinking-block';
@@ -458,7 +469,7 @@ function processStreamEvents(events) {
                         Thinking...
                     </summary>
                     <div class="thinking-content"></div>`;
-                streamState.contentEl.insertBefore(details, streamState.textArea);
+                streamState.contentEl.appendChild(details);
                 streamState.thinkingEl = details.querySelector('.thinking-content');
                 break;
             }
@@ -476,12 +487,11 @@ function processStreamEvents(events) {
                     if (indicator) indicator.classList.add('done');
                 }
                 streamState.thinkingEl = null;
-                streamState.textArea.classList.add('stream-cursor');
                 break;
             }
 
             case 'content':
-                streamState.textArea.textContent += event.text;
+                ensureActiveTextArea().textContent += event.text;
                 break;
         }
     }
@@ -492,8 +502,7 @@ function processStreamEvents(events) {
 function addToolCallBlock(name, args) {
     if (!streamState) return;
 
-    // Remove cursor
-    streamState.textArea.classList.remove('stream-cursor');
+    deactivateTextArea();
 
     const block = document.createElement('details');
     block.className = 'tool-call-block';
@@ -511,7 +520,7 @@ function addToolCallBlock(name, args) {
             </div>
         </div>`;
 
-    streamState.contentEl.insertBefore(block, streamState.textArea);
+    streamState.contentEl.appendChild(block);
     streamState.toolBlocks.push({ name, element: block, hasResult: false });
     chatContainer.scrollTop = chatContainer.scrollHeight;
 }
@@ -544,9 +553,6 @@ function updateToolResultBlock(name, result) {
         // Detect and render images in result
         detectAndRenderImages(result, resultArea);
     }
-
-    // Re-add cursor to text area for next content
-    streamState.textArea.classList.add('stream-cursor');
     chatContainer.scrollTop = chatContainer.scrollHeight;
 }
 
@@ -578,47 +584,47 @@ function finalizeStream() {
 
     // Flush remaining parser buffer
     processStreamEvents(streamState.parser.flush());
+    deactivateTextArea();
 
-    // Remove streaming cursor
-    streamState.textArea.classList.remove('stream-cursor');
+    // Process all stream-text spans
+    const textBlocks = streamState.contentEl.querySelectorAll('.stream-text');
+    textBlocks.forEach(block => {
+        const rawText = block.textContent.trim();
+        if (rawText) {
+            // Replace raw text with rendered markdown
+            const rendered = DOMPurify.sanitize(marked.parse(rawText));
+            const mdDiv = document.createElement('div');
+            mdDiv.className = 'rendered-content';
+            mdDiv.innerHTML = rendered;
+            block.replaceWith(mdDiv);
 
-    // Get the raw text content
-    const rawText = streamState.textArea.textContent.trim();
+            // Syntax highlighting
+            mdDiv.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
 
-    if (rawText) {
-        // Replace raw text with rendered markdown
-        const rendered = DOMPurify.sanitize(marked.parse(rawText));
-        const mdDiv = document.createElement('div');
-        mdDiv.className = 'rendered-content';
-        mdDiv.innerHTML = rendered;
-        streamState.textArea.replaceWith(mdDiv);
+            // Add "Run Script" buttons
+            mdDiv.querySelectorAll('pre').forEach(pre => {
+                const codeEl = pre.querySelector('code');
+                if (!codeEl) return;
+                const lang = (codeEl.className.match(/language-(\w+)/) || [])[1] || 'python';
+                if (!['python', 'py', 'bash', 'sh', 'javascript', 'js'].includes(lang)) return;
+                const btn = document.createElement('button');
+                btn.className = 'run-script-btn';
+                btn.innerHTML = '<i class="fas fa-play" style="margin-right:3px"></i>Run';
+                btn.title = `Run this ${lang} snippet in the sandbox`;
+                btn.onclick = () => runCodeBlock(codeEl.textContent, lang, pre);
+                pre.style.position = 'relative';
+                pre.appendChild(btn);
+            });
 
-        // Syntax highlighting
-        mdDiv.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
-
-        // Add "Run Script" buttons
-        mdDiv.querySelectorAll('pre').forEach(pre => {
-            const codeEl = pre.querySelector('code');
-            if (!codeEl) return;
-            const lang = (codeEl.className.match(/language-(\w+)/) || [])[1] || 'python';
-            if (!['python', 'py', 'bash', 'sh', 'javascript', 'js'].includes(lang)) return;
-            const btn = document.createElement('button');
-            btn.className = 'run-script-btn';
-            btn.innerHTML = '<i class="fas fa-play" style="margin-right:3px"></i>Run';
-            btn.title = `Run this ${lang} snippet in the sandbox`;
-            btn.onclick = () => runCodeBlock(codeEl.textContent, lang, pre);
-            pre.style.position = 'relative';
-            pre.appendChild(btn);
-        });
-
-        // Detect images in rendered markdown
-        mdDiv.querySelectorAll('img').forEach(img => {
-            img.classList.add('chat-image');
-            img.onclick = () => openLightbox(img.src);
-        });
-    } else {
-        streamState.textArea.remove();
-    }
+            // Detect images in rendered markdown
+            mdDiv.querySelectorAll('img').forEach(img => {
+                img.classList.add('chat-image');
+                img.onclick = () => openLightbox(img.src);
+            });
+        } else {
+            block.remove();
+        }
+    });
 
     streamState = null;
     setLoading(false);
@@ -669,34 +675,74 @@ async function stopGeneration() {
 // =============================================================================
 // 7. RENDER (for non-streamed messages: user bubbles, legacy)
 // =============================================================================
-function renderMessage(role, text, audioUrl = null) {
+function renderMessage(role, text, audioUrl = null, toolCalls = null, toolName = null) {
     const div = document.createElement('div');
-    div.className = role === 'user' ? 'flex justify-end' : 'flex justify-start relative group';
+    const isUser = role === 'user';
+    div.className = isUser ? 'flex justify-end' : 'flex justify-start relative group';
 
-    let content = text;
-    if (role === 'ai') {
-        content = content.replace(/### \[TOOL_OUTPUT\] ###[\s\S]*?### \[END_OUTPUT\] ###/g, '');
-        content = content.replace(
-            /<think>([\s\S]*?)<\/think>/g,
-            `<details class="thinking-block">
-                <summary><span class="thinking-indicator done"></span>Internal Reasoning</summary>
-                <div class="thinking-content">$1</div>
-             </details>`
-        );
-        content = DOMPurify.sanitize(marked.parse(content));
+    let html = '';
+    if (role === 'tool') {
+        const isError = text.includes('"status": "error"') || text.includes('Error');
+        html = `
+            <div class="ai-message bg-[#161b22] border border-gray-800 max-w-[85%] rounded-2xl px-5 py-4 shadow-xl mb-4 relative overflow-hidden group">
+                <details class="tool-call-block" open>
+                    <summary>
+                        <span class="tool-indicator ${isError ? 'error' : 'done'}"></span>
+                        <code>${escapeHtml(toolName || 'tool')}</code> — result
+                    </summary>
+                    <div class="tool-call-content">
+                        <div class="tool-result-area">
+                            <div class="tool-section-label">Result</div>
+                            <pre><code class="tool-result-code">${escapeHtml(text)}</code></pre>
+                        </div>
+                    </div>
+                </details>
+            </div>`;
+    } else {
+        let content = text || '';
+        if (role === 'assistant' || role === 'ai') {
+            content = content.replace(/### \[TOOL_OUTPUT\] ###[\s\S]*?### \[END_OUTPUT\] ###/g, '');
+            content = content.replace(
+                /<think>([\s\S]*?)<\/think>/g,
+                `<details class="thinking-block">
+                    <summary><span class="thinking-indicator done"></span>Internal Reasoning</summary>
+                    <div class="thinking-content">$1</div>
+                 </details>`
+            );
+            content = DOMPurify.sanitize(marked.parse(content));
+
+            if (toolCalls && toolCalls.length) {
+                toolCalls.forEach(tc => {
+                    const name = tc.function.name;
+                    const args = tc.function.arguments;
+                    content += `
+                        <details class="tool-call-block" open>
+                            <summary>
+                                <span class="tool-indicator done"></span>
+                                <code>${escapeHtml(name)}</code> — called
+                            </summary>
+                            <div class="tool-call-content">
+                                <div class="tool-section-label">Arguments</div>
+                                <pre><code>${escapeHtml(typeof args === 'string' ? args : JSON.stringify(args, null, 2))}</code></pre>
+                            </div>
+                        </details>`;
+                });
+            }
+        }
+
+        html = `
+            <div class="${isUser ? 'bg-blue-600' : 'ai-message bg-[#161b22] border border-gray-800'}
+                         max-w-[85%] rounded-2xl px-5 py-4 shadow-xl mb-4 relative overflow-hidden group"
+                 role="${isUser ? 'none' : 'article'}">
+                <div class="markdown-body">${content}</div>
+            </div>`;
     }
 
-    div.innerHTML = `
-        <div class="${role === 'user' ? 'bg-blue-600' : 'ai-message bg-[#161b22] border border-gray-800'}
-                     max-w-[85%] rounded-2xl px-5 py-4 shadow-xl mb-4 relative overflow-hidden group"
-             role="${role === 'ai' ? 'article' : 'none'}">
-            <div class="markdown-body">${content}</div>
-        </div>`;
-
+    div.innerHTML = html;
     chatContainer.appendChild(div);
     div.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
 
-    if (role === 'ai' && audioUrl) {
+    if (!isUser && audioUrl) {
         addTtsButton(div.querySelector('.ai-message'), audioUrl);
     }
 
@@ -829,7 +875,7 @@ async function loadConversation(convId) {
 
         chatContainer.innerHTML = '';
         history.forEach(msg => {
-            renderMessage(msg.role === 'user' ? 'user' : 'ai', msg.content);
+            renderMessage(msg.role, msg.content, null, msg.tool_calls, msg.name);
         });
 
         fetchConversations();

@@ -214,9 +214,9 @@ def get_audit():
 def get_history():
     """Returns the current conversation history for the sidebar."""
     messages = [
-        {"role": m["role"], "content": m.get("content", "")}
+        {"role": m["role"], "content": m.get("content", ""), "name": m.get("name"), "tool_calls": m.get("tool_calls")}
         for m in bridge.history
-        if m["role"] in ("user", "assistant") and m.get("content", "").strip()
+        if m["role"] in ("user", "assistant", "tool")
     ]
     return jsonify({"history": messages})
 

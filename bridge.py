@@ -82,9 +82,16 @@ def _sanitize_args(args: dict) -> dict:
             return {k: fix(v) for k, v in value.items()}
         if isinstance(value, list):
             return [fix(i) for i in value]
-        return value
-
     return {k: fix(v) for k, v in args.items()}
+
+
+def is_looping(history):
+    """Detect if the last 3 tool turns were errors (potential loop)."""
+    tools_turns = [m for m in history if m.get("role") == "tool" and m.get("content")]
+    if len(tools_turns) >= 3:
+        last_3 = tools_turns[-3:]
+        return all("error" in m["content"].lower() or "critical" in m["content"].lower() for m in last_3)
+    return False
 
 
 class AIBridge:
@@ -222,6 +229,9 @@ class AIBridge:
             self.history.append({"role": "system", "content": system_prompt})
             # --- NEW: Log the initial system message ---
             self.log_action("System", system_prompt)
+
+        if is_looping(self.history):
+            prompt += "\n\n(INTERNAL MONITOR: You are in an error loop. Verify file paths and names immediately using 'ls'.)"
 
         self.history.append({"role": "user", "content": prompt})
         self.log_action("User", prompt)
@@ -493,6 +503,9 @@ class AIBridge:
             )
             self.history.append({"role": "system", "content": system_prompt})
             self.log_action("System", system_prompt)
+
+        if is_looping(self.history):
+            prompt += "\n\n(INTERNAL MONITOR: You are in an error loop. Verify file paths and names immediately using 'ls'.)"
 
         self.history.append({"role": "user", "content": prompt})
         self.log_action("User", prompt)

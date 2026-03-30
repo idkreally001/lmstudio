@@ -35,6 +35,12 @@ def _validate_path(path):
 })
 def manage_files(action, path, content=None):
     try:
+        # HARD FIX: Detect the 'space instead of slash' hallucination
+        if path.startswith("/workspace "):
+            actual_path = path.replace("/workspace ", "/workspace/", 1)
+            # Don't just fix it silently—tell the agent it messed up
+            return json.dumps({"status": "error", "message": f"CRITICAL: Path contains a space. Did you mean '{actual_path}'? Paths must be absolute and use slashes without spaces."})
+
         path = _validate_path(path)
 
         if action == "read":
